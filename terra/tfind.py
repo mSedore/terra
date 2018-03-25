@@ -43,7 +43,7 @@ class Grid(object):
 
         dt = t[1:] - t[:-1]
         meddt = np.median(dt)
-        assert np.allclose(dt, meddt, rtol=1e-3), "t must be evenly spaced"
+        assert np.allclose(dt, meddt, rtol=1e1), "t must be evenly spaced"
 
         self.dt = meddt
         self.t = t 
@@ -354,13 +354,11 @@ def fold_ffa(dM,Pcad0):
 def pgram_max(t,fm,par):
     """
     Periodogram: Check max values
-
     Computes s2n for range of P, t0, and twd. However, for every
     putative transit, we evaluate the transit depth having cut the
     deepest transit and the second deepest transit. We require that
     the mean depth after having cut the test max two values not be too
     much smaller. Good at removing locations with 2 outliers.
-
     Parameters 
     ----------
     t : t[0] provides starting time
@@ -369,11 +367,9 @@ def pgram_max(t,fm,par):
           - Pcad1 (lower period limit)
           - Pcad2 (upper period limit)
           - twdG (grid of trial durations to compute)
-
     Returns
     -------
     pgram : Record array with following fields
-
     """
     ncad = fm.size
     PcadG = np.arange(par['Pcad1'],par['Pcad2'])
@@ -391,6 +387,7 @@ def pgram_max(t,fm,par):
         ('mean',float),
         ('t0',float),
         ('noise',float),
+        ('ntrans',int)
         ]
 
     pgram = np.zeros( (len(twdG),len(PcadG)),dtype=dtype_pgram)
@@ -401,7 +398,8 @@ def pgram_max(t,fm,par):
         ('mean',float),
         ('s2n',float),
         ('col',int),
-        ('t0',float)
+        ('t0',float),
+        ('ntrans',int)
     ] 
 
     # Loop over different transit durations
@@ -432,7 +430,7 @@ def pgram_max(t,fm,par):
             mask[row,col] = dM.mask
 
             # Sum along columns (clipping top 0, 1, 2 values)
-            datasum,datacnt = cumsum_top(data,mask,2)
+            datasum,datacnt = cumsum_top(data,mask, 2)
             # datasum[-1] are the is the summed columns having not
             # clipped any values. Update results array. For t0, add
             # half the transit with because column index corresponds
@@ -445,26 +443,51 @@ def pgram_max(t,fm,par):
             r['s2n'] = s / np.sqrt(c) / noise            
             r['c'][:] = c
             r['col'] = icol
-            r['t0'] = ( r['col'] + twd / 2.0) * config.lc + t[0] 
+            r['t0'] = ( r['col'] + twd / 2.0) * config.lc + t[0]
+            r['ntrans'] = np.shape(datacnt)[0]
+            
+            #should try to just remove the ones with nan for s2n
+            #r = r[~np.isnan(r['s2n'])]
+            if(np.any(np.isnan(r['s2n']))):
+                continue
 
             # Compute mean transit depth after removing the deepest
             # transit, datacnt[-2], and the second deepest transit,
             # datacnt[-3]. The mean transit depth must be > 0.5 it's
             # former value. Also, require 3 transits.
-            mean_clip1 = datasum[-2] / datacnt[-2]
-            mean_clip2 = datasum[-3] / datacnt[-3]
-            b = (
-                (mean_clip1 > 0.5 * r['mean'] ) & 
-                (mean_clip2 > 0.5 * r['mean']) & 
-                (r['c'] >= 3)
-            )
+            
+            #change this condition to be "if there are at least 3 transits"
+            #then clip the top two
+            if(np.shape(datacnt)[0] >= 3):
+                mean_clip1 = datasum[-2] / datacnt[-2]
+                mean_clip2 = datasum[-3] / datacnt[-3]
+                b1 = (
+                        (r['c']>=3) &
+                        (mean_clip1 > 0.5 * r['mean'] ) & 
+                        (mean_clip2 > 0.5 * r['mean'])
+                        )
+                b2 = (
+                        (r['c']==2) &
+                        (mean_clip1 > 0.5 * r['mean'] )
+                        )
+                b=np.logical_or(b1,b2)
+                #b=b1
+                rcut=r[b]
+                if(np.shape(rcut)[0]==0):
+                    continue
+            
+            else:
+                mean_clip1 = datasum[-2] / datacnt[-2]
+                b = (
+                        (mean_clip1 > 0.5 * r['mean']) & 
+                        (r['c'] >= 2)
+                        )
+                rcut = r[b]
+                if(np.shape(rcut)[0]==0):
+                    continue
 
-            if ~np.any(b):
-                continue 
-
-            rcut = r[b]
             rmax = rcut[np.argmax(rcut['s2n'])]
-            names = ['mean','s2n','c','t0']
+            names = ['mean','s2n','c','t0','ntrans']
             for n in names:
                 pgram[itwd,iPcad][n] = rmax[n]
             pgram[itwd,iPcad]['Pcad'] = Pcad
@@ -807,14 +830,14 @@ def periodogram_parameters(P1, P2, tbase, nseg, Rstar=1.0, Mstar=1.0,
 
 def cumsum_top(data,mask,k):
     """
-
     Take a data and mask array with shape = (m,n)
-
     For each column of data, sort the values (ignoring values that are
     masked out). Then compute the sum along columns of the m-k
     smallest values, then the m-k+1 smallest values until all m rows
     are summed.
-
+    
+    This is taking in folded data. When there are less than 3 folds, it fails
+    
     Parameters 
     ----------
     data : ndim = 2,
@@ -828,6 +851,7 @@ def cumsum_top(data,mask,k):
 
     datainf = data.copy() 
     datazero = data.copy()
+    
 
     datainf[mask] = -np.inf 
     datazero[mask] = 0.0
@@ -841,12 +865,27 @@ def cumsum_top(data,mask,k):
 
     # Substitue the sum of all the higher rows in to the nrowout row
     # of output arrays
-    datazero[-nrowout,:] = np.sum(datazero[:-k],axis=0)
-    cnt[-nrowout,:] = np.sum(cnt[:-k],axis=0)
+    #this is where I get the error that index -3 is out of bounds for axis 0 w size 2
     
-    datasum = np.cumsum(datazero[-nrowout:],axis=0)
-    # Count number of masked elements
-    datacnt = np.cumsum(cnt[-nrowout:],axis=0) 
+    if(nrow==2):
+        datazero[-(nrowout-1),:] = np.sum(datazero[:-(k-1)],axis=0)
+        cnt[-(nrowout-1),:] = np.sum(cnt[:-(k-1)],axis=0)
+        datasum = np.cumsum(datazero[-(nrowout-1):],axis=0)
+        datacnt = np.cumsum(cnt[-(nrowout-1):],axis=0)
+    elif(nrow==1 or nrow==0):
+        k=0
+        nrowout=1
+        datazero[-nrowout,:] = np.sum(datazero[:-k],axis=0)
+        cnt[-nrowout,:] = np.sum(cnt[:-k],axis=0)
+        datasum = np.cumsum(datazero[-nrowout:],axis=0)
+        # Count number of masked elements
+        datacnt = np.cumsum(cnt[-nrowout:],axis=0)
+    else:
+        datazero[-nrowout,:] = np.sum(datazero[:-k],axis=0)
+        cnt[-nrowout,:] = np.sum(cnt[:-k],axis=0)
+        datasum = np.cumsum(datazero[-nrowout:],axis=0)
+        # Count number of masked elements
+        datacnt = np.cumsum(cnt[-nrowout:],axis=0) 
     return datasum,datacnt
 
 def test_cumsum_top():

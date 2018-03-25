@@ -95,12 +95,12 @@ def preprocess(pipe):
     pipe.update_header('finished_preprocess',True)
     return
 
-def grid_search(pipe, P1=0.5, P2=None, periodogram_mode='max'):
+def grid_search(pipe, P1=5, P2=None, periodogram_mode='max'):
     """Run the grid based search
 
     Args:
-        P1 (Optional[float]): Minimum period to search over. Default is 0.5
-        P2 (Optional[float]): Maximum period to search over. Default is half 
+        P1 (Optional[float]): Minimum period to search over. Default is 5
+        P2 (Optional[float]): Maximum period to search over. Default is the full 
             the time baseline
         **kwargs : passed to grid.periodogram
 
@@ -109,7 +109,7 @@ def grid_search(pipe, P1=0.5, P2=None, periodogram_mode='max'):
 
     """
     if type(P2) is type(None):
-        P2 = 0.49 * pipe.lc.t.ptp() 
+        P2 = 0.95 * pipe.lc.t.ptp() 
 
     t = np.array(pipe.lc.t)
     fm = pipe._get_fm() 
@@ -130,8 +130,62 @@ def grid_search(pipe, P1=0.5, P2=None, periodogram_mode='max'):
         # Take the highest s2n row at each period bin
         pgram = pgram.sort_values(['Pbin','s2n']).groupby('Pbin').last()
         pgram = pgram.reset_index()
+        
 
+    #this is where I have changed to store the first few peaks
     row = pgram.sort_values('s2n').iloc[-1]
+    aliases = [row.P*x for x in [0.0125, 0.25, 0.5, 1, 2]]
+    sorted_pgram = pgram.sort_values('s2n')
+    
+    #rows stores the unique entries; we always want the first one
+#    rows = []
+#    rows.append(sorted_pgram.iloc[-1])
+#    #go through the periodogram for highest s2n with a new period and store it in rows
+#    i=1
+#    while(i<len(pgram) and len(rows)<10):
+#        new = True
+#        entry = sorted_pgram.iloc[-i]
+#        for alias in aliases:
+#            #this check should be sensitive to the period! Longer periods should be ignored for longer
+#            if abs(entry.P-alias)<(0.02*alias):
+#                new=False
+#        #if it's not an alias, make sure it's not part of a peak already stored
+#        if(new):
+#            for stored_value in [rows[x].P for x in range(len(rows))]:
+#                if abs(entry.P-stored_value)<1:
+#                    new=False
+#        if(new):
+#            rows.append(sorted_pgram.iloc[-i])
+#        i+=1
+    rows, aliases, aliases_min, aliases_max = [], [], [], []
+    for i in range(1,len(pgram)):
+        row = sorted_pgram.iloc[-i]
+        #stop recording peaks at this threshold
+        if row.s2n < 8.0:
+            break
+        #check if it's an alias
+        new = True
+        for alias in aliases:
+            if abs(row.P-alias)<(0.015*alias):
+                new=False
+                continue
+        if(new):
+            #store this peak's aliases if it has >3 transits
+            print row.ntrans
+            if row.ntrans >= 3.0:
+                for x in [0.0125, 0.25, 0.5, 1, 2]:
+                    aliases.append(row.P*x)
+                    aliases_min.append((row.P*x)-(0.01*row.P*x))
+                    aliases_max.append((row.P*x)+(0.01*row.P*x))
+            else:
+                for x in [1,2]:
+                    aliases.append(row.P*x)
+                    aliases_min.append((row.P*x)-(0.01*row.P*x))
+                    aliases_max.append((row.P*x)+(0.01*row.P*x))
+            rows.append(row)
+    pipe.update_header('rows', rows, "List of stored peaks")
+    #np.sqrt(pipe.pgram.sort_values('s2n').iloc[-1]['mean'])
+    pipe.update_header('grid_rp', np.sqrt(row['mean']), 'Expected planet radius')
     pipe.update_header('grid_s2n', row.s2n, "Periodogram peak s2n")
     pipe.update_header('grid_P', row.P, "Periodogram peak period")
     pipe.update_header('grid_t0', row.t0, "Periodogram peak transit time")
@@ -140,8 +194,17 @@ def grid_search(pipe, P1=0.5, P2=None, periodogram_mode='max'):
     )
     pipe.update_table('pgram',pgram,'periodogram')
     pipe.update_header('finished_grid_search',True)
-    print row
     return None
+
+def choose_peak(pipe, x):
+    if not pipe.finished_grid_search:
+        print "Do a grid search before switching the peak"
+        return
+    pipe.update_header('grid_P', ((pipe.rows)[x]).P)
+    pipe.update_header('grid_rp', (np.sqrt((pipe.rows)[x])['mean']))
+    pipe.update_header('grid_t0', ((pipe.rows)[x]).t0)
+    pipe.update_header('grid_tdur', ((pipe.rows)[x]).tdur)
+    pipe.update_header('grid_s2n', ((pipe.rows)[x]).s2n)
 
 def fit_transits(pipe):
     """Fit transits
@@ -176,6 +239,7 @@ def fit_transits(pipe):
 
     # Compute initial parameters. Fits are more robust if we star with
     # transits that are too wide as opposed to to narrow
+    # immediatelychecks grid_P!
     P = pipe.grid_P
     t0 = pipe.grid_t0 
     tdur = pipe.grid_tdur 
